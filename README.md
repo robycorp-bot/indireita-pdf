@@ -22,6 +22,12 @@ Tambem ha `POST /api/v1/pdfs/enhance-zip`: envie um ZIP e receba um ZIP com cada
 PDF tratado no mesmo caminho interno. Arquivos que nao sao PDF permanecem no pacote
 sem alteracao.
 
+Para um PDF grande e misto, use `POST /api/v1/pdfs/enhance-and-group`. Ele trata
+cada pagina, compara o layout e termos recorrentes e devolve um ZIP contendo
+arquivos com nomes descritivos como `grupo-borderos-safra.pdf` quando houver termos
+recorrentes confiaveis. Sem texto suficiente, usa `grupo-001.pdf`. Paginas sem
+evidencia suficiente de um padrao repetido vao juntas para `padrao-nao-encontrado.pdf`.
+
 ### Tesseract: orientacao em 90/180/270 graus
 
 A correcao de pequena inclinacao funciona sem Tesseract. Para detectar paginas de lado ou de cabeca para baixo, e necessario ter o executavel `tesseract` no `PATH`, com o modelo **osd.traineddata** disponivel. Use uma distribuicao confiavel ou um pacote portatil no seu usuario; nao e necessario configurar privilegios administrativos no projeto.
@@ -87,6 +93,22 @@ curl.exe --fail-with-body -X POST "http://127.0.0.1:8000/api/v1/pdfs/enhance-zip
   -F "auto_orient=true" `
   --output "C:/documentos/pdfs-melhorados.zip"
 ```
+
+### Tratar e agrupar um PDF
+
+```powershell agrupar-pdf.ps1
+curl.exe --fail-with-body -X POST "http://127.0.0.1:8000/api/v1/pdfs/enhance-and-group" `
+  -F "file=@C:/documentos/lote-misto.pdf;type=application/pdf" `
+  -F "auto_orient=true" `
+  --output "C:/documentos/pdfs-agrupados.zip"
+```
+
+O agrupamento e conservador: ele compara a distribuicao visual de texto, campos,
+cabecalhos e elementos de pagina, e usa palavras OCR recorrentes como confirmacao e
+para compor o nome curto de cada grupo.
+Ele nao tenta inferir o assunto nem cria grupos de uma pagina; estas vao para
+`padrao-nao-encontrado.pdf`. Os nomes dos grupos sao neutros porque o endpoint nao
+atribui uma classificacao semantica que nao possa comprovar.
 
 | Campo | Padrao | Descricao |
 | --- | --- | --- |

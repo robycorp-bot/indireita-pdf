@@ -5,6 +5,8 @@ import pytest
 from app.processing import (
     Options,
     Report,
+    cluster_patterns,
+    descriptive_group_name,
     detect_orientation,
     enhance_image,
     estimate_skew,
@@ -93,3 +95,26 @@ def test_uncertain_orientation_is_not_applied(monkeypatch):
     report = Report()
     assert detect_orientation(text_image(), report) == 0
     assert "orientation_low_confidence" in report.warnings
+
+
+def test_pattern_clustering_requires_a_consistent_layout_for_every_page():
+    first = np.array([1, 0, 0], dtype=np.float32)
+    second = np.array([0.99, 0.01, 0], dtype=np.float32)
+    third = np.array([0, 1, 0], dtype=np.float32)
+    first /= np.linalg.norm(first)
+    second /= np.linalg.norm(second)
+    assert cluster_patterns([(first, {"safra"}), (second, {"safra"}), (third, set())]) == [
+        [0, 1], [2]
+    ]
+
+
+def test_descriptive_group_name_uses_recurring_specific_words():
+    feature = np.array([1], dtype=np.float32)
+    features = [(feature, {"borderos", "safra", "documento"})] * 3
+    assert descriptive_group_name(features, [0, 1, 2], 1) == "grupo-borderos-safra"
+
+
+def test_descriptive_group_name_falls_back_without_reliable_text():
+    feature = np.array([1], dtype=np.float32)
+    features = [(feature, {"documento"})] * 2
+    assert descriptive_group_name(features, [0, 1], 4) == "grupo-004"

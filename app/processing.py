@@ -3,9 +3,12 @@
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
+import unicodedata
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -358,4 +361,166 @@ def process_zip(source: Path, target: Path, options: Options, settings: Settings
                 report.reoriented_pages += pdf_report.reoriented_pages
                 report.warnings.update(pdf_report.warnings)
                 output.write(processed, arcname=entry.filename)
+    return report
+
+
+def page_pattern(image: Image) -> tuple[NDArray[np.float32], set[str]]:
+    """Cria assinaturas compactas de layout e de texto para agrupar paginas.
+
+    A assinatura visual privilegia blocos, margens, carimbos e cabecalhos, em
+    vez do texto exato. O texto OCR e apenas uma evidencia complementar: duas
+    paginas sao agrupadas se compartilham estrutura forte ou estrutura e termos
+    recorrentes. Isso evita nomear como "mesmo padrao" paginas isoladas.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    preview = resize_for_analysis(gray, 900)
+    _, ink = cv2.threshold(preview, 0, 1, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    layout = cv2.resize(ink.astype(np.float32), (96, 96), interpolation=cv2.INTER_AREA)
+    layout = cv2.GaussianBlur(layout, (0, 0), 1.2).reshape(-1)
+    norm = float(np.linalg.norm(layout))
+    if norm:
+        layout /= norm
+    words: set[str] = set()
+    executable = tesseract_command()
+    if executable:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = executable
+            text = pytesseract.image_to_string(preview, config="--psm 6", timeout=12)
+            words = {
+                word.lower()
+                for word in text.split()
+                if len(word) >= 4 and any(character.isalpha() for character in word)
+            }
+        except (pytesseract.TesseractError, RuntimeError, OSError):
+            pass
+    return layout, words
+
+
+def pattern_similarity(
+    first: tuple[NDArray[np.float32], set[str]], second: tuple[NDArray[np.float32], set[str]]
+) -> tuple[float, float]:
+    visual = float(np.dot(first[0], second[0]))
+    union = first[1] | second[1]
+    text = len(first[1] & second[1]) / len(union) if union else 0.0
+    return visual, text
+
+
+def cluster_patterns(features: list[tuple[NDArray[np.float32], set[str]]]) -> list[list[int]]:
+    """Agrupamento completo: toda pagina deve combinar com todo o grupo."""
+    groups: list[list[int]] = []
+    for index, feature in enumerate(features):
+        for group in groups:
+            similarities = [pattern_similarity(feature, features[member]) for member in group]
+            # Layout quase igual basta; textos semelhantes confirmam layouts com
+            # campos variaveis, como boletos e formularios preenchidos.
+            is_match = all(
+                visual >= 0.82 or (visual >= 0.68 and text >= 0.12)
+                for visual, text in similarities
+            )
+            if is_match:
+                group.append(index)
+                break
+        else:
+            groups.append([index])
+    return groups
+
+
+GENERIC_GROUP_WORDS = {
+    "documento", "pagina", "paginas", "relacao", "emissao", "data", "valor", "total",
+    "conta", "contas", "codigo", "numero", "titulos", "titulo", "cliente", "banco",
+    "agencia", "endereco", "servico", "referente", "informacoes", "informacao", "para",
+    "com", "dos", "das", "que", "uma", "por", "the", "this", "from",
+}
+
+
+def descriptive_group_name(
+    features: list[tuple[NDArray[np.float32], set[str]]], group: list[int], number: int
+) -> str:
+    """Gera um nome curto a partir dos termos recorrentes no grupo."""
+    counts = Counter(word for page_index in group for word in features[page_index][1])
+    minimum = max(2, math.ceil(len(group) * 0.6))
+    candidates = [
+        word
+        for word, count in counts.items()
+        if count >= minimum and word not in GENERIC_GROUP_WORDS and len(word) >= 4
+    ]
+    # Frequencia primeiro; palavras mais longas tendem a ser nomes/titulos e
+    # tornam o nome mais informativo quando todas aparecem na mesma quantidade.
+    candidates.sort(key=lambda word: (-counts[word], -len(word), word))
+    safe_words = []
+    for word in candidates:
+        normalized = unicodedata.normalize("NFKD", word).encode("ascii", "ignore").decode()
+        normalized = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+        if normalized and normalized not in safe_words:
+            safe_words.append(normalized)
+        if len(safe_words) == 3:
+            break
+    suffix = "-".join(safe_words)
+    return f"grupo-{suffix}" if suffix else f"grupo-{number:03d}"
+
+
+def process_and_group_pdf(
+    source: Path, target: Path, options: Options, settings: Settings
+) -> Report:
+    """Trata cada pagina e devolve um ZIP de PDFs agrupados por padrao."""
+    try:
+        document = pymupdf.open(stream=source.read_bytes(), filetype="pdf")
+    except (pymupdf.FileDataError, RuntimeError, ValueError) as exc:
+        raise ProcessingError("PDF invalido, corrompido ou nao suportado.") from exc
+    with document:
+        if not document.is_pdf or document.needs_pass:
+            raise ProcessingError("PDF protegido por senha ou nao suportado.")
+        if not document.page_count:
+            raise ProcessingError("O PDF nao tem paginas.")
+        if document.page_count > settings.max_pages:
+            raise ProcessingError(f"Limite de {settings.max_pages} paginas excedido.", 413)
+        with tempfile.TemporaryDirectory(prefix="endireita-pdf-groups-") as workspace:
+            root = Path(workspace)
+            processed_pages: list[Path] = []
+            features: list[tuple[NDArray[np.float32], set[str]]] = []
+            report = Report()
+            for index in range(document.page_count):
+                original_page = root / f"original-{index:04d}.pdf"
+                processed_page = root / f"pagina-{index + 1:04d}.pdf"
+                with pymupdf.open() as one_page:
+                    one_page.insert_pdf(document, from_page=index, to_page=index)
+                    one_page.save(original_page)
+                page_report = process_pdf(original_page, processed_page, options, settings)
+                report.pages += page_report.pages
+                report.deskewed_pages += page_report.deskewed_pages
+                report.reoriented_pages += page_report.reoriented_pages
+                report.warnings.update(page_report.warnings)
+                with pymupdf.open(processed_page) as ready:
+                    pixmap = ready[0].get_pixmap(dpi=100, colorspace=pymupdf.csRGB, alpha=False)
+                    image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+                        pixmap.height, pixmap.width, 3
+                    ).copy()
+                features.append(page_pattern(image))
+                processed_pages.append(processed_page)
+            groups = cluster_patterns(features)
+            # Grupos com uma unica pagina nao tem evidencia de um padrao repetido.
+            recognized = [group for group in groups if len(group) >= 2]
+            unknown = [page for group in groups if len(group) == 1 for page in group]
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as package:
+                used_names: set[str] = set()
+                for number, group in enumerate(recognized, start=1):
+                    group_name = descriptive_group_name(features, group, number)
+                    if group_name in used_names:
+                        group_name = f"{group_name}-{number:03d}"
+                    used_names.add(group_name)
+                    output_path = root / f"{group_name}.pdf"
+                    with pymupdf.open() as grouped:
+                        for page_index in group:
+                            with pymupdf.open(processed_pages[page_index]) as page_pdf:
+                                grouped.insert_pdf(page_pdf)
+                        grouped.save(output_path, garbage=4, deflate=True)
+                    package.write(output_path, arcname=output_path.name)
+                if unknown:
+                    output_path = root / "padrao-nao-encontrado.pdf"
+                    with pymupdf.open() as grouped:
+                        for page_index in unknown:
+                            with pymupdf.open(processed_pages[page_index]) as page_pdf:
+                                grouped.insert_pdf(page_pdf)
+                        grouped.save(output_path, garbage=4, deflate=True)
+                    package.write(output_path, arcname=output_path.name)
     return report

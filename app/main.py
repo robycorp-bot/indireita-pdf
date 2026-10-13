@@ -15,7 +15,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import Settings
-from app.processing import Options, ProcessingError, process_pdf, process_zip, tesseract_command
+from app.processing import (
+    Options,
+    ProcessingError,
+    process_and_group_pdf,
+    process_pdf,
+    process_zip,
+    tesseract_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +269,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request, file, options, process_zip, "input.zip", "pdfs-melhorados.zip",
             "application/zip",
             "pdfs-melhorados.zip", b"PK",
+        )
+
+    @application.post(
+        "/api/v1/pdfs/enhance-and-group",
+        tags=["PDF"],
+        summary="Endireitar, melhorar e agrupar as paginas de um PDF",
+        response_class=FileResponse,
+        responses={
+            200: {
+                "description": "ZIP com PDFs de paginas que compartilham o mesmo padrao.",
+                "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+            },
+            413: {"description": "Limite de upload, paginas ou pixels excedido."},
+            422: {"description": "Parametros invalidos ou PDF invalido/protegido por senha."},
+            503: {"description": "Capacidade de processamento ocupada; tente novamente."},
+        },
+    )
+    async def enhance_and_group_pdf(
+        request: Request,
+        file: Annotated[UploadFile, File(description="PDF a tratar e separar por padrao.")],
+        dpi: Annotated[int, Form(ge=100, le=450)] = 300,
+        max_skew: Annotated[float, Form(ge=1, le=20)] = 15.0,
+        auto_orient: Annotated[bool, Form()] = True,
+        denoise: Annotated[bool, Form()] = True,
+        remove_shadows: Annotated[bool, Form()] = True,
+        sharpen: Annotated[float, Form(ge=0, le=1.5)] = 0.5,
+        color_mode: Annotated[str, Form(pattern="^(grayscale|color|blackwhite)$")] = "grayscale",
+    ) -> FileResponse:
+        options = Options(dpi, max_skew, auto_orient, denoise, remove_shadows, sharpen, color_mode)
+        return await process_upload(
+            request, file, options, process_and_group_pdf, "input.pdf", "pdfs-agrupados.zip",
+            "application/zip", "pdfs-agrupados.zip", b"%PDF-",
         )
 
     return application

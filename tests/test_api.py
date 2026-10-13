@@ -138,6 +138,8 @@ def test_swagger_and_openapi(client):
     assert "application/pdf" in operation["responses"]["200"]["content"]
     zip_operation = schema["paths"]["/api/v1/pdfs/enhance-zip"]["post"]
     assert "application/zip" in zip_operation["responses"]["200"]["content"]
+    grouping_operation = schema["paths"]["/api/v1/pdfs/enhance-and-group"]["post"]
+    assert "application/zip" in grouping_operation["responses"]["200"]["content"]
     assert client.get("/health").json()["status"] == "ok"
 
 
