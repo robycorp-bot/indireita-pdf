@@ -44,6 +44,7 @@ def test_success_returns_readable_pdf_with_same_page_count(client):
     assert response.status_code == 200, response.text
     assert response.headers["content-type"] == "application/pdf"
     assert response.headers["x-pages-processed"] == "2"
+    assert response.headers["x-enhance-passes"] == "5"
     assert response.headers["cache-control"] == "no-store"
     assert "pdf-melhorado.pdf" in response.headers["content-disposition"]
     with pymupdf.open(stream=response.content, filetype="pdf") as result:
@@ -140,6 +141,8 @@ def test_swagger_and_openapi(client):
     assert "application/zip" in zip_operation["responses"]["200"]["content"]
     grouping_operation = schema["paths"]["/api/v1/pdfs/enhance-and-group"]["post"]
     assert "application/zip" in grouping_operation["responses"]["200"]["content"]
+    split_operation = schema["paths"]["/api/v1/pdfs/split"]["post"]
+    assert "application/zip" in split_operation["responses"]["200"]["content"]
     assert client.get("/health").json()["status"] == "ok"
 
 

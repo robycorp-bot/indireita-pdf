@@ -68,6 +68,8 @@ O Dockerfile executa a aplicacao como usuario nao root. A imagem Docker nao foi 
 
 `POST /api/v1/pdfs/enhance`, corpo **multipart/form-data**. Todos os parametros sao campos do formulario, nao parametros de query. A resposta de sucesso e binaria, `application/pdf`, com nome `pdf-melhorado.pdf`.
 
+Esse endpoint reaplica o processamento 5 vezes em sequencia: a saida de cada passada alimenta a proxima, e somente o PDF da ultima passada e devolvido. O cabecalho `X-Enhance-Passes` informa quantas passadas foram executadas.
+
 Exemplo no Windows (use `curl.exe`, nao o alias `curl` do PowerShell antigo):
 
 ```powershell enviar-pdf.ps1

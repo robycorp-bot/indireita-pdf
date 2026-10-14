@@ -18,8 +18,10 @@ from app.config import Settings
 from app.processing import (
     Options,
     ProcessingError,
+    Report,
     process_and_group_pdf,
     process_pdf,
+    split_pdf,
     process_zip,
     tesseract_command,
 )
@@ -107,8 +109,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         media_type: str,
         download_name: str,
         signature: bytes,
+        passes: int = 1,
     ) -> FileResponse:
-        """Persiste um upload, executa um job isolado e limpa seus temporarios."""
+        """Persiste um upload, executa jobs isolados encadeados e limpa temporarios.
+
+        Quando passes > 1, a saida de cada passada alimenta a proxima — como se o
+        usuario baixasse o resultado e reenviasse — mas apenas a ultima saida e
+        devolvida. A passada para antecipadamente se nenhuma pagina precisou de
+        correcao, pois nesse caso as passadas restantes seriam equivalentes a
+        reenviar um documento ja estabilizado.
+        """
         temporary = tempfile.TemporaryDirectory(prefix="endireita-pdf-")
         response_owns_directory = False
         acquired = False
@@ -139,31 +149,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     503, "Servidor ocupado. Tente novamente em alguns segundos.",
                     headers={"Retry-After": "5"},
                 ) from exc
+            report: Report | None = None
+            passes_run = 0
+            current = source
+            final_path = target
             try:
-                future = asyncio.get_running_loop().run_in_executor(
-                    request.app.state.pool, processor, source, target, options, settings
-                )
-                try:
-                    report = await asyncio.shield(future)
-                except asyncio.CancelledError:
+                for pass_index in range(passes):
+                    last_pass = pass_index == passes - 1
+                    pass_target = target if last_pass else (
+                        Path(temporary.name) / f"passada-{pass_index + 1:02d}.pdf"
+                    )
+                    future = asyncio.get_running_loop().run_in_executor(
+                        request.app.state.pool, processor, current, pass_target,
+                        options, settings,
+                    )
                     try:
-                        await asyncio.shield(future)
-                    except Exception:
-                        logger.exception("Processamento falhou apos cancelamento da requisicao")
-                    raise
+                        pass_report = await asyncio.shield(future)
+                    except asyncio.CancelledError:
+                        try:
+                            await asyncio.shield(future)
+                        except Exception:
+                            logger.exception("Processamento falhou apos cancelamento da requisicao")
+                        raise
+                    passes_run += 1
+                    if report is None:
+                        report = pass_report
+                    else:
+                        report.pages = pass_report.pages
+                        report.deskewed_pages += pass_report.deskewed_pages
+                        report.reoriented_pages += pass_report.reoriented_pages
+                        report.warnings |= pass_report.warnings
+                    current = pass_target
+                    final_path = pass_target
+                    if (
+                        passes == 1
+                        and pass_report.deskewed_pages == 0
+                        and pass_report.reoriented_pages == 0
+                    ):
+                        break
             except ProcessingError as exc:
                 raise HTTPException(exc.status_code, str(exc)) from exc
             except Exception as exc:
                 logger.exception("Falha no processamento")
                 raise HTTPException(500, "Nao foi possivel processar o arquivo.") from exc
             response = FileResponse(
-                target,
+                final_path,
                 media_type=media_type,
                 filename=download_name,
                 headers={
                     "X-Pages-Processed": str(report.pages),
                     "X-Pages-Deskewed": str(report.deskewed_pages),
                     "X-Pages-Reoriented": str(report.reoriented_pages),
+                    "X-Enhance-Passes": str(passes_run),
                     "X-Processing-Warnings": ",".join(sorted(report.warnings)) or "none",
                     "Cache-Control": "no-store",
                 },
@@ -229,7 +266,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         options = Options(dpi, max_skew, auto_orient, denoise, remove_shadows, sharpen, color_mode)
         return await process_upload(
             request, file, options, process_pdf, "input.pdf", "output.pdf", "application/pdf",
-            "pdf-melhorado.pdf", b"%PDF-",
+            "pdf-melhorado.pdf", b"%PDF-", passes=5,
         )
 
     @application.post(
@@ -301,6 +338,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await process_upload(
             request, file, options, process_and_group_pdf, "input.pdf", "pdfs-agrupados.zip",
             "application/zip", "pdfs-agrupados.zip", b"%PDF-",
+        )
+
+    @application.post(
+        "/api/v1/pdfs/split",
+        tags=["PDF"],
+        summary="Separar cada pagina de um PDF em um arquivo individual",
+        response_class=FileResponse,
+        responses={
+            200: {
+                "description": "ZIP contendo um PDF por pagina, com nomes baseados no texto detectado.",
+                "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+            },
+            413: {"description": "Limite de upload, paginas ou pixels excedido."},
+            422: {"description": "Parametros invalidos, PDF invalido ou protegido por senha."},
+            503: {"description": "Capacidade de processamento ocupada; tente novamente."},
+        },
+    )
+    async def split_pdf_endpoint(
+        request: Request,
+        file: Annotated[UploadFile, File(description="PDF a separar em paginas individuais.")],
+    ) -> FileResponse:
+        return await process_upload(
+            request, file, Options(), split_pdf, "input.pdf", "pdfs-separados.zip",
+            "application/zip", "pdfs-separados.zip", b"%PDF-",
         )
 
     return application

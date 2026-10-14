@@ -364,6 +364,64 @@ def process_zip(source: Path, target: Path, options: Options, settings: Settings
     return report
 
 
+def split_pdf(source: Path, target: Path, options: Options, settings: Settings) -> Report:
+    """Separa cada pagina em um PDF e nomeia o arquivo com base no OCR da pagina."""
+    try:
+        document = pymupdf.open(stream=source.read_bytes(), filetype="pdf")
+    except (pymupdf.FileDataError, RuntimeError, ValueError) as exc:
+        raise ProcessingError("PDF invalido, corrompido ou nao suportado.") from exc
+    with document, tempfile.TemporaryDirectory(prefix="endireita-pdf-split-") as workspace:
+        if not document.is_pdf:
+            raise ProcessingError("O arquivo precisa ser um PDF.")
+        if document.needs_pass:
+            raise ProcessingError("PDF protegido por senha nao e suportado.")
+        if not document.page_count:
+            raise ProcessingError("O PDF nao tem paginas.")
+        if document.page_count > settings.max_pages:
+            raise ProcessingError(f"Limite de {settings.max_pages} paginas excedido.", 413)
+
+        page_count = document.page_count
+        root = Path(workspace)
+        used_names: set[str] = set()
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as package:
+            for index, page in enumerate(document):
+                words: list[str] = []
+                executable = tesseract_command()
+                if executable:
+                    try:
+                        pytesseract.pytesseract.tesseract_cmd = executable
+                        pixmap = page.get_pixmap(dpi=150, colorspace=pymupdf.csRGB, alpha=False)
+                        preview = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+                            pixmap.height, pixmap.width, 3
+                        )
+                        text = pytesseract.image_to_string(preview, config="--psm 6", timeout=12)
+                        words = [
+                            re.sub(r"[^a-z0-9-]", "", unicodedata.normalize("NFKD", word)
+                                   .encode("ascii", "ignore").decode().lower())
+                            for word in text.split()
+                        ]
+                        words = [word for word in words if len(word) >= 3 and word not in GENERIC_GROUP_WORDS]
+                    except (pytesseract.TesseractError, RuntimeError, OSError):
+                        words = []
+
+                stem = "-".join(words[:4]) or "pagina"
+                base_name = f"{stem}-pagina-{index + 1:03d}"
+                name = base_name
+                suffix = 2
+                while name in used_names:
+                    name = f"{base_name}-{suffix}"
+                    suffix += 1
+                used_names.add(name)
+                output_path = root / f"{name}.pdf"
+                one_page = pymupdf.open()
+                with one_page:
+                    one_page.insert_pdf(document, from_page=index, to_page=index)
+                    one_page.save(output_path, garbage=4, deflate=True)
+                package.write(output_path, arcname=output_path.name)
+
+    return Report(pages=page_count)
+
+
 def page_pattern(image: Image) -> tuple[NDArray[np.float32], set[str]]:
     """Cria assinaturas compactas de layout e de texto para agrupar paginas.
 
